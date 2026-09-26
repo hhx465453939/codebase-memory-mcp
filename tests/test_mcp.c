@@ -2498,6 +2498,115 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+/* Docs grep coverage (handoff 2026-09-26): text documents never enter the
+ * symbol graph, but search_code must still find them. The scoped filelist
+ * supplements the indexed set with on-disk docs, so a token that only exists
+ * in docs/notes.md comes back as a raw match tagged file_class=doc (RED on
+ * unfixed code: grep was scoped to indexed files only -> 0 hits). */
+TEST(search_code_docs_greppable) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_docs_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    char proj_dir[640];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    cbm_mkdir(proj_dir);
+    char docs_dir[640];
+    snprintf(docs_dir, sizeof(docs_dir), "%s/docs", proj_dir);
+    cbm_mkdir(docs_dir);
+
+    char src_path[768];
+    snprintf(src_path, sizeof(src_path), "%s/main.go", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    if (!fp) {
+        rmdir(docs_dir);
+        rmdir(proj_dir);
+        rmdir(tmp);
+        FAIL("cannot write source file");
+    }
+    fprintf(fp, "package main\n\nfunc HandleRequest() error {\n\treturn nil\n}\n");
+    fclose(fp);
+
+    /* The doc carries a token that exists NOWHERE in the indexed source. */
+    char doc_path[768];
+    snprintf(doc_path, sizeof(doc_path), "%s/notes.md", docs_dir);
+    fp = fopen(doc_path, "w");
+    if (!fp) {
+        unlink(src_path);
+        rmdir(docs_dir);
+        rmdir(proj_dir);
+        rmdir(tmp);
+        FAIL("cannot write doc file");
+    }
+    fprintf(fp, "# Notes\n\nDOCGREPTOKEN protocol lives here.\n");
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "docs-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, proj_dir);
+
+    /* One node so main.go is "indexed" (cbm_store_list_files -> scoped path). */
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "HandleRequest",
+                    .qualified_name = "docs-search.main.HandleRequest",
+                    .file_path = "main.go",
+                    .start_line = 3,
+                    .end_line = 5};
+    cbm_store_upsert_node(st, &n);
+
+    /* Default (compact/TOON) mode: doc hit shows up as a raw match row. */
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"DOCGREPTOKEN\","
+             "\"project\":\"docs-search\"}}}");
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "docs/notes.md") != NULL);
+    ASSERT_TRUE(strstr(resp, "DOCGREPTOKEN") != NULL);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    free(resp);
+
+    /* Legacy JSON mode: the raw match carries the file_class discriminator. */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"DOCGREPTOKEN\","
+             "\"project\":\"docs-search\",\"format\":\"json\"}}}");
+    resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "docs/notes.md") != NULL);
+    ASSERT_TRUE(strstr(resp, "\"file_class\":\"doc\"") != NULL);
+    free(resp);
+
+    /* path_filter prefilter covers docs too (same predicate as indexed files). */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"DOCGREPTOKEN\","
+             "\"project\":\"docs-search\",\"path_filter\":\"^docs/\"}}}");
+    resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "docs/notes.md") != NULL);
+    free(resp);
+
+    unlink(doc_path);
+    unlink(src_path);
+    rmdir(docs_dir);
+    rmdir(proj_dir);
+    rmdir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Reproduce-first (#687): scoped content search over a repo whose ROOT PATH
  * contains a space. write_scoped_filelist emits "<root>/<file>" records that the
  * Unix pipeline pipes to grep via xargs. With plain `xargs` (newline-split) the
@@ -6442,6 +6551,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_docs_greppable);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);

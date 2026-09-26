@@ -39,6 +39,8 @@ enum {
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include "discover/discover.h"
+#include "foundation/compat_fs.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "pipeline/pipeline.h"
@@ -512,6 +514,9 @@ static const tool_def_t TOOLS[] = {
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
      "the knowledge graph: deduplicates matches into containing functions, ranks by structural "
      "importance (definitions first, popular functions next, tests last). "
+     "Text docs (.md/.txt/.rst/.mdx under the project, excluding heavy data/cache dirs) are "
+     "also searched: doc hits have no graph symbols, so they appear as raw matches tagged "
+     "file_class=\"doc\". "
      "Modes: compact (default, signatures only — token efficient), full (source capped at a "
      "60-line window around the first match per hit; source_truncated marks the cut — use "
      "get_code_snippet for the complete symbol), "
@@ -6343,6 +6348,9 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── search_code v2: graph-augmented code search ─────────────── */
 
+/* Doc-path classifier (defined with the doc_scan helpers below). */
+static bool cbm_path_is_doc(const char *path);
+
 /* Strip non-ASCII bytes to guarantee valid UTF-8 JSON output */
 enum { ASCII_MAX = 127 };
 static void sanitize_ascii(char *s) {
@@ -6676,13 +6684,14 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
 
     int raw_output = raw_count < MAX_RAW ? raw_count : MAX_RAW;
     if (raw_output > 0) {
-        static const char *const rcols[] = {"file", "line", "content"};
-        cbm_toon_table_header(&sb, "raw", raw_output, rcols, 3);
+        static const char *const rcols[] = {"file", "line", "content", "class"};
+        cbm_toon_table_header(&sb, "raw", raw_output, rcols, 4);
         for (int ri = 0; ri < raw_output; ri++) {
             cbm_toon_row_begin(&sb);
             cbm_toon_cell_str(&sb, raw[ri].file, true);
             cbm_toon_cell_int(&sb, raw[ri].line, false);
             cbm_toon_cell_str(&sb, raw[ri].content, false);
+            cbm_toon_cell_str(&sb, cbm_path_is_doc(raw[ri].file) ? "doc" : "code", false);
             cbm_toon_row_end(&sb);
         }
     }
@@ -6768,6 +6777,8 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
             yyjson_mut_obj_add_str(doc, item, "file", raw[ri].file);
             yyjson_mut_obj_add_int(doc, item, "line", raw[ri].line);
             yyjson_mut_obj_add_str(doc, item, "content", raw[ri].content);
+            yyjson_mut_obj_add_str(doc, item, "file_class",
+                                   cbm_path_is_doc(raw[ri].file) ? "doc" : "code");
             yyjson_mut_arr_add_val(raw_arr, item);
         }
         yyjson_mut_obj_add_val(doc, root_obj, "raw_matches", raw_arr);
@@ -6993,6 +7004,169 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
     }
 }
 
+/* ── Doc-file grep coverage ─────────────────────────────────────── */
+/* Text documents never enter the symbol graph (no AST value), but agents
+ * must still be able to grep them via search_code (handoff 2026-09-26:
+ * "docs must be searchable"). The scoped filelist therefore supplements
+ * the indexed file set with on-disk docs walked under root_path at query
+ * time — no re-index needed, grep reads the live content anyway. */
+
+static const char *DOC_SCAN_EXTENSIONS[] = {".md", ".txt", ".rst", ".mdx", NULL};
+
+/* Heavy data/runtime dirs that discover's ALWAYS_SKIP_DIRS does not list
+ * but that would dominate the walk (and add noise) on data-heavy repos
+ * (market-data parquet trees, run caches, build outputs). */
+static const char *DOC_SCAN_EXTRA_SKIP_DIRS[] = {"cache", "data",     "archive", "archives",
+                                                 "_archived", "logs", "log",     "build",
+                                                 "out", NULL};
+
+enum { DOC_SCAN_MAX_DEPTH = 40 }; /* symlink/junction cycle guard */
+
+/* DT_LNK comes from <dirent.h> on POSIX; cbm_dirent_t.d_type is always 0
+ * on Windows, so the check is dead code there. Local fallback keeps this
+ * translation unit independent of the dirent include. */
+#if !defined(_WIN32) && !defined(DT_LNK)
+#define DT_LNK 3
+#endif
+
+static int doc_ext_casecmp(const char *a, const char *b) {
+    while (*a && *b) {
+        int ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') {
+            ca += 'a' - 'A';
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb += 'a' - 'A';
+        }
+        if (ca != cb) {
+            return ca - cb;
+        }
+        a++;
+        b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+/* True when the filename carries a text-document extension. */
+static bool doc_scan_is_doc_name(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name) {
+        return false;
+    }
+    for (int i = 0; DOC_SCAN_EXTENSIONS[i]; i++) {
+        if (doc_ext_casecmp(dot, DOC_SCAN_EXTENSIONS[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Classifier for grep hits: a path whose file extension is a text document
+ * is "doc"; everything else is "code". Works on root-relative match paths. */
+static bool cbm_path_is_doc(const char *path) {
+    const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && bslash > slash) {
+        slash = bslash;
+    }
+#endif
+    return doc_scan_is_doc_name(slash ? slash + 1 : path);
+}
+
+static int doc_scan_strcmp_indirect(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Depth-first walk collecting text docs. Appends "<root>/<rel>" records
+ * (same format as write_scoped_filelist) for every doc file that passes
+ * the filters. sorted_indexed is the sorted indexed-file array used for
+ * dedup (a user extension config can already index docs). Never follows
+ * symlinks; per-directory failures are skipped silently — the walk is a
+ * best-effort supplement to the indexed set, not a correctness gate. */
+static void doc_scan_walk(const char *abs_dir, const char *rel_dir, const char *root_path,
+                          FILE *fl, bool has_path_filter, cbm_regex_t *path_regex,
+                          char **sorted_indexed, int indexed_count, int *written, int depth) {
+    if (depth > DOC_SCAN_MAX_DEPTH) {
+        return;
+    }
+    cbm_dir_t *d = cbm_opendir(abs_dir);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        const char *name = ent->name;
+        if (ent->d_type == DT_LNK) {
+            continue; /* never follow symlinks: cycle safety (POSIX) */
+        }
+        char abs_child[CBM_SZ_1K];
+        char rel_child[CBM_SZ_512];
+        int n = snprintf(abs_child, sizeof(abs_child), "%s/%s", abs_dir, name);
+        if (n < 0 || n >= (int)sizeof(abs_child)) {
+            continue;
+        }
+        if (rel_dir[0] != '\0') {
+            n = snprintf(rel_child, sizeof(rel_child), "%s/%s", rel_dir, name);
+        } else {
+            n = snprintf(rel_child, sizeof(rel_child), "%s", name);
+        }
+        if (n < 0 || n >= (int)sizeof(rel_child)) {
+            continue;
+        }
+        if (ent->is_dir) {
+            if (cbm_should_skip_dir(name, CBM_MODE_FULL)) {
+                continue;
+            }
+            bool extra_skip = false;
+            for (int i = 0; DOC_SCAN_EXTRA_SKIP_DIRS[i]; i++) {
+                if (strcmp(name, DOC_SCAN_EXTRA_SKIP_DIRS[i]) == 0) {
+                    extra_skip = true;
+                    break;
+                }
+            }
+            if (extra_skip) {
+                continue;
+            }
+            doc_scan_walk(abs_child, rel_child, root_path, fl, has_path_filter, path_regex,
+                          sorted_indexed, indexed_count, written, depth + 1);
+            continue;
+        }
+        if (!doc_scan_is_doc_name(name) || cbm_has_ignored_suffix(name, CBM_MODE_FULL)) {
+            continue;
+        }
+        /* A source path never legitimately contains a newline or carriage
+         * return — same injection guard as the indexed-list writer. */
+        if (strpbrk(rel_child, "\r\n") != NULL) {
+            continue;
+        }
+        if (has_path_filter && path_regex &&
+            cbm_regexec(path_regex, rel_child, 0, NULL, 0) != CBM_REG_OK) {
+            continue;
+        }
+        if (indexed_count > 0) {
+            /* bsearch key must have char* pointer semantics — passing
+             * &rel_child (a char(*)[N] array pointer) would make the
+             * comparator dereference the array's first bytes as a pointer. */
+            const char *rel_key = rel_child;
+            if (bsearch(&rel_key, sorted_indexed, (size_t)indexed_count, sizeof(char *),
+                        doc_scan_strcmp_indirect) != NULL) {
+                continue; /* already covered by the indexed set */
+            }
+        }
+        (void)fwrite(root_path, 1, strlen(root_path), fl);
+        (void)fputc('/', fl);
+        (void)fwrite(rel_child, 1, strlen(rel_child), fl);
+#ifdef _WIN32
+        (void)fputc('\n', fl);
+#else
+        (void)fputc('\0', fl);
+#endif
+        (*written)++;
+    }
+    cbm_closedir(d);
+}
+
 /* Write indexed file list for scoped grep. Returns true if scoped.
  * When a path_filter is provided, apply it here — before grep — so large
  * indexed projects do not scan files only for collect_grep_matches to discard
@@ -7000,6 +7174,9 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
  * compiled regex run against the same root-relative path (separators
  * normalized on Windows first), so prefiltering can only skip files whose
  * hits would be dropped anyway — results-preserving by construction.
+ * The list additionally supplements the indexed set with on-disk text
+ * documents (docs never get graph nodes but must stay greppable — see the
+ * doc_scan_walk comment), with the same path_filter prefilter applied.
  * *out_written receives the number of records written (0 = the filter
  * excluded every indexed file). */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
@@ -7054,6 +7231,20 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
             (void)fputc('\0', fl);
 #endif
             written++;
+        }
+        /* Supplement with on-disk docs: they carry no graph nodes but must
+         * still be greppable. A sorted copy of the indexed list powers the
+         * dedup check inside the walk (a user extension config may already
+         * cover docs). Walk failures degrade silently — the indexed set is
+         * still fully written at this point. */
+        char **sorted_docs_dedup = malloc((size_t)indexed_count * sizeof(char *));
+        if (sorted_docs_dedup) {
+            memcpy(sorted_docs_dedup, indexed_files, (size_t)indexed_count * sizeof(char *));
+            qsort(sorted_docs_dedup, (size_t)indexed_count, sizeof(char *),
+                  doc_scan_strcmp_indirect);
+            doc_scan_walk(root_path, "", root_path, fl, has_path_filter, path_regex,
+                          sorted_docs_dedup, indexed_count, &written, 0);
+            free(sorted_docs_dedup);
         }
         (void)fclose(fl);
         ok = true;
