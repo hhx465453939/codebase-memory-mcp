@@ -1,5 +1,6 @@
 /* Transactional binary activation. See activation_transaction.h. */
 #include "cli/activation_transaction.h"
+#include "foundation/log.h"
 #include "foundation/macos_acl.h"
 
 #include <errno.h>
@@ -666,8 +667,10 @@ static bool activation_source_directory_secure(const char *directory,
 }
 
 static bool activation_directory_secure(const char *directory, int *unused,
-                                        activation_file_identity_t *identity_out) {
+                                        activation_file_identity_t *identity_out,
+                                        bool require_group_clean) {
     (void)unused;
+    (void)require_group_clean; /* Windows ACLs already express cross-account grants. */
     g_activation_refusal_object = directory;
     HANDLE handle = activation_windows_directory_open_no_reparse(directory);
     BY_HANDLE_FILE_INFORMATION information;
@@ -728,15 +731,18 @@ static char *activation_posix_walk_path(const char *directory) {
     return activation_string_copy(directory);
 }
 
-static bool activation_posix_intermediate_secure(const struct stat *status) {
+static bool activation_posix_intermediate_secure(const struct stat *status,
+                                                 bool require_group_clean) {
     bool trusted_owner = status->st_uid == 0 || status->st_uid == geteuid();
-    bool private_permissions = (status->st_mode & 0022) == 0;
+    mode_t writable_mask = require_group_clean ? 0022 : 0002;
+    bool private_permissions = (status->st_mode & writable_mask) == 0;
     bool root_sticky = status->st_uid == 0 && (status->st_mode & S_ISVTX) != 0;
     return S_ISDIR(status->st_mode) && trusted_owner && (private_permissions || root_sticky);
 }
 
 static bool activation_directory_secure(const char *directory, int *directory_fd_out,
-                                        activation_file_identity_t *identity_out) {
+                                        activation_file_identity_t *identity_out,
+                                        bool require_group_clean) {
     int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
@@ -745,6 +751,7 @@ static bool activation_directory_secure(const char *directory, int *directory_fd
     if (!walk_path) {
         return false;
     }
+    mode_t writable_mask = require_group_clean ? 0022 : 0002;
     bool absolute = walk_path[0] == '/';
     int descriptor = open(absolute ? "/" : ".", flags);
     bool ok = descriptor >= 0;
@@ -755,7 +762,7 @@ static bool activation_directory_secure(const char *directory, int *directory_fd
     if (ok && *cursor) {
         struct stat initial_status;
         ok = fstat(descriptor, &initial_status) == 0 &&
-             activation_posix_intermediate_secure(&initial_status);
+             activation_posix_intermediate_secure(&initial_status, require_group_clean);
     }
     while (ok && *cursor) {
         char *component = cursor;
@@ -776,7 +783,8 @@ static bool activation_directory_secure(const char *directory, int *directory_fd
             while (*remaining == '/') {
                 remaining++;
             }
-            if (next_ok && *remaining && !activation_posix_intermediate_secure(&next_status)) {
+            if (next_ok && *remaining &&
+                !activation_posix_intermediate_secure(&next_status, require_group_clean)) {
                 next_ok = false;
             }
             if (next_ok) {
@@ -796,7 +804,7 @@ static bool activation_directory_secure(const char *directory, int *directory_fd
     }
     struct stat status;
     ok = ok && fstat(descriptor, &status) == 0 && S_ISDIR(status.st_mode) &&
-         status.st_uid == geteuid() && (status.st_mode & 0022) == 0 &&
+         status.st_uid == geteuid() && (status.st_mode & writable_mask) == 0 &&
          activation_posix_acl_empty(descriptor);
     free(walk_path);
     if (!ok) {
@@ -817,12 +825,12 @@ static bool activation_directory_still_valid(const cbm_activation_transaction_t 
 #ifdef _WIN32
     int ignored = 0;
     activation_file_identity_t current;
-    return activation_directory_secure(transaction->directory_path, &ignored, &current) &&
+    return activation_directory_secure(transaction->directory_path, &ignored, &current, false) &&
            activation_identity_equal(&current, &transaction->directory_identity);
 #else
     struct stat status;
     if (transaction->directory_fd < 0 || fstat(transaction->directory_fd, &status) != 0 ||
-        !S_ISDIR(status.st_mode) || status.st_uid != geteuid() || (status.st_mode & 0022) != 0 ||
+        !S_ISDIR(status.st_mode) || status.st_uid != geteuid() || (status.st_mode & 0002) != 0 ||
         !activation_posix_acl_empty(transaction->directory_fd)) {
         return false;
     }
@@ -836,7 +844,7 @@ static bool activation_directory_still_valid(const cbm_activation_transaction_t 
     int path_fd = -1;
     activation_file_identity_t path_identity;
     bool path_same =
-        activation_directory_secure(transaction->directory_path, &path_fd, &path_identity) &&
+        activation_directory_secure(transaction->directory_path, &path_fd, &path_identity, false) &&
         activation_identity_equal(&path_identity, &current);
     if (path_fd >= 0) {
         (void)close(path_fd);
@@ -1257,13 +1265,21 @@ static cbm_activation_transaction_status_t activation_transaction_prepare(
         activation_transaction_destroy(transaction);
         return CBM_ACTIVATION_TRANSACTION_INVALID_ARGUMENT;
     }
+    /* Directory trust tier (2026-09-26, extends the source-candidate fix):
+     * Debian/Ubuntu user-private-group setups (default umask 002) make every
+     * self-created install directory carry the group-write bit without
+     * exposing a cross-account write path — the directory owner must equal
+     * the euid and the staged/published files carry their own identity
+     * snapshot plus build-fingerprint validation. Only world-writability is
+     * refused (0002); the earlier 0022 mask broke every local install under
+     * that umask. Requires the identity recheck below and at commit time. */
 #ifdef _WIN32
     int ignored = 0;
     if (!activation_directory_secure(transaction->directory_path, &ignored,
-                                     &transaction->directory_identity)) {
+                                     &transaction->directory_identity, false)) {
 #else
     if (!activation_directory_secure(transaction->directory_path, &transaction->directory_fd,
-                                     &transaction->directory_identity)) {
+                                     &transaction->directory_identity, false)) {
 #endif
         activation_transaction_destroy(transaction);
         return CBM_ACTIVATION_TRANSACTION_IO;
@@ -1391,7 +1407,20 @@ static bool activation_source_open(const char *path, activation_native_file_t *f
 #else
     int directory_fd = -1;
     activation_file_identity_t directory_identity;
-    if (!activation_directory_secure(directory, &directory_fd, &directory_identity)) {
+    /* Source candidates follow the Windows source-side trust tier, which
+     * already tolerates broader cross-account grants than the target side:
+     * the candidate is the running binary itself or a fresh download owned by
+     * the invoking user, and its bytes are pinned by the identity recheck
+     * below plus the staged copy's build-fingerprint validation. The ancestor
+     * chain and the candidate therefore only refuse WORLD-writability here.
+     * Requiring a fully group-clean chain would fail every install on
+     * Debian/Ubuntu user-private-group setups (default umask 002), where
+     * 0775 work directories and freshly built binaries are the norm without
+     * exposing a cross-account write path. Targets keep the stricter 0022
+     * rule: they are live on disk across sessions and have no second
+     * validation line behind them. */
+    if (!activation_directory_secure(directory, &directory_fd, &directory_identity,
+                                     false)) {
         free(directory);
         free(name);
         return false;
@@ -1399,7 +1428,7 @@ static bool activation_source_open(const char *path, activation_native_file_t *f
     struct stat before;
     bool before_valid = fstatat(directory_fd, name, &before, AT_SYMLINK_NOFOLLOW) == 0 &&
                         S_ISREG(before.st_mode) && before.st_uid == geteuid() &&
-                        before.st_nlink == 1 && (before.st_mode & 0022) == 0;
+                        before.st_nlink == 1 && (before.st_mode & 0002) == 0;
     int flags = O_RDONLY | O_CLOEXEC;
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
@@ -1408,7 +1437,7 @@ static bool activation_source_open(const char *path, activation_native_file_t *f
     struct stat information;
     bool valid = file >= 0 && fstat(file, &information) == 0 && S_ISREG(information.st_mode) &&
                  information.st_uid == geteuid() && information.st_nlink == 1 &&
-                 (information.st_mode & 0022) == 0 && activation_posix_acl_empty(file) &&
+                 (information.st_mode & 0002) == 0 && activation_posix_acl_empty(file) &&
                  information.st_dev == before.st_dev && information.st_ino == before.st_ino;
     (void)close(directory_fd);
     if (!valid) {
@@ -1466,6 +1495,10 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_file(
     }
     activation_native_file_t source = ACTIVATION_INVALID_FILE;
     if (!activation_source_open(candidate_path, &source)) {
+        /* Environment-compat diagnostics: Ceph/NFS mounts and hardened umasks
+         * fail here in ways the identity snapshot alone does not explain. */
+        cbm_log_warn("activation.stage", "step", "source_open", "errno",
+                     errno != 0 ? strerror(errno) : "unknown");
         activation_failed_stage_cleanup(transaction);
         return CBM_ACTIVATION_TRANSACTION_IO;
     }
@@ -1502,6 +1535,14 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_file(
     bool staged_closed = activation_native_close(staged);
     if (!copied || total == 0 || !durable || !source_closed || !staged_closed ||
         !activation_sync_directory(transaction)) {
+        const char *step = !copied               ? "copy"
+                           : total == 0          ? "empty_source"
+                           : !durable            ? "fsync_staged"
+                           : !source_closed      ? "source_close"
+                           : !staged_closed      ? "staged_close"
+                                                 : "sync_directory";
+        cbm_log_warn("activation.stage", "step", step, "errno",
+                     errno != 0 ? strerror(errno) : "unknown");
         activation_failed_stage_cleanup(transaction);
         return CBM_ACTIVATION_TRANSACTION_IO;
     }

@@ -934,6 +934,11 @@ TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
     snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
 #endif
     write_test_file(bin_target, "old binary must survive");
+    /* Fixture mode parity: a published target is always chmod'd 0755 by the
+     * installer, never group-writable. The default write mode would otherwise
+     * fail the activation snapshot's cross-account write check on umask-002
+     * hosts before the behaviour under test is even reached. */
+    chmod(bin_target, 0644);
 
     cli_activation_fake_t fake = {
         .participants_active = true,
@@ -1079,6 +1084,11 @@ TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
 #endif
     write_test_file(bin_target, "old binary must survive");
+    /* Fixture mode parity: a published target is always chmod'd 0755 by the
+     * installer, never group-writable. The default write mode would otherwise
+     * fail the activation snapshot's cross-account write check on umask-002
+     * hosts before the behaviour under test is even reached. */
+    chmod(bin_target, 0644);
 
     /* The prompt and candidate staging complete first. If the coordinated
      * cohort still cannot drain, neither binary publication nor index reset
@@ -1619,6 +1629,9 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
 #endif
     write_test_file(bin_target, "binary must survive active-daemon refusal");
+    /* Published-target mode parity: the installer never leaves a group- or
+     * world-writable binary at the target (see the fixture note above). */
+    chmod(bin_target, 0644);
 
     cli_activation_fake_t fake = {
         .participants_active = true,
@@ -1677,6 +1690,9 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
 #endif
     write_test_file(bin_target, "binary must survive uninstall race");
+    /* Published-target mode parity: the installer never leaves a group- or
+     * world-writable binary at the target (see the fixture note above). */
+    chmod(bin_target, 0644);
 
     /* Prompts and removal staging happen first. A failed cohort drain must
      * preserve both the executable and optional index cleanup. */
@@ -3834,6 +3850,9 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
     snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp", bin_dir);
 #endif
     write_test_file(bin_path, "installed binary must remain live\n");
+    /* Published-target mode parity: the installer never leaves a group- or
+     * world-writable binary at the target (see the fixture note above). */
+    chmod(bin_path, 0644);
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
